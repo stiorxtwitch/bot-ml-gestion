@@ -67,7 +67,13 @@ async function checkNotifications() {
       if (notif.type === 'order' && notif.order_id) {
         await handleNewOrder(notif);
       } else if (notif.type === 'contact' && notif.contact_id) {
-        await handleNewContact(notif);
+        // Si le contact a déjà un channel Discord → c'est un message de suivi du client
+        const { data: contact } = await supabase.from('contacts').select('*').eq('id', notif.contact_id).single();
+        if (contact?.discord_channel_id) {
+          await handleClientReply(contact);
+        } else {
+          await handleNewContact(notif);
+        }
       }
       // Marquer comme traité
       await supabase.from('discord_notifications').update({ processed: true }).eq('id', notif.id);
@@ -181,6 +187,41 @@ async function handleNewContact(notif) {
 
   console.log(`✅ Channel contact créé : #${channelName}`);
 }
+
+// ── MESSAGE DE SUIVI DU CLIENT ──────────────
+async function handleClientReply(contact) {
+  // Récupérer le dernier message 'in' non encore relayé
+  const { data: msgs } = await supabase
+    .from('discord_messages')
+    .select('*')
+    .eq('contact_id', contact.id)
+    .eq('direction', 'in')
+    .order('created_at', { ascending: false })
+    .limit(1);
+
+  if (!msgs?.length) return;
+  const lastMsg = msgs[0];
+
+  const guild = client.guilds.cache.get(GUILD_ID);
+  if (!guild) return;
+  const channel = guild.channels.cache.get(contact.discord_channel_id);
+  if (!channel) return;
+
+  const embed = new EmbedBuilder()
+    .setColor(0x4f7af8)
+    .setTitle(`💬 Nouveau message du client`)
+    .setDescription(lastMsg.content)
+    .addFields(
+      { name: '👤 Client', value: `${contact.first_name} ${contact.last_name}`, inline: true },
+      { name: '📧 Email', value: contact.email, inline: true },
+    )
+    .setFooter({ text: `Contact #${contact.id} — répondez avec ^^answer <message>` })
+    .setTimestamp();
+
+  await channel.send({ embeds: [embed] });
+  console.log(`📨 Message client relayé dans #${channel.name}`);
+}
+
 
 // ── COMMANDES DISCORD ──────────────────────
 client.on('messageCreate', async (message) => {
