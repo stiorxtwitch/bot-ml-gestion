@@ -1,0 +1,16 @@
+{
+  "name": "ml-devlopping-bot",
+  "version": "1.0.0",
+  "description": "Bot Discord ML Devlopping",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "@supabase/supabase-js": "^2.39.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
