@@ -1,24 +1,65 @@
 // ============================================
 // ML DEVLOPPING — Bot Discord
 // ============================================
-// Installation: npm install discord.js @supabase/supabase-js node-fetch
+// Installation: npm install discord.js @supabase/supabase-js node-fetch express
 // Node.js 18+ recommandé
 // ============================================
 
 const { Client, GatewayIntentBits, PermissionsBitField, EmbedBuilder } = require('discord.js');
 const { createClient } = require('@supabase/supabase-js');
+const express = require('express');
+
+// ── EXPRESS SERVER (Keep-Alive pour Render) ──
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    bot: client.user?.tag || 'connecting...',
+    uptime: Math.floor(process.uptime()) + 's',
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('/ping', (req, res) => {
+  res.json({ pong: true, timestamp: new Date().toISOString() });
+});
+
+app.listen(PORT, () => {
+  console.log(`🌐 Serveur Express actif sur le port ${PORT}`);
+});
+
+// ── AUTO PING (toutes les 5 minutes) ─────────
+const RENDER_URL = process.env.RENDER_URL; // Ex: https://mon-bot.onrender.com
+
+function startKeepAlive() {
+  if (!RENDER_URL) {
+    console.warn('⚠️  RENDER_URL non défini — keep-alive désactivé');
+    return;
+  }
+
+  setInterval(async () => {
+    try {
+      const res = await fetch(`${RENDER_URL}/ping`);
+      const data = await res.json();
+      console.log(`🏓 Keep-alive ping OK — ${data.timestamp}`);
+    } catch (err) {
+      console.error('❌ Keep-alive ping échoué:', err.message);
+    }
+  }, 5 * 60 * 1000); // toutes les 5 minutes
+
+  console.log(`🔁 Keep-alive démarré → ${RENDER_URL}/ping`);
+}
 
 // ── CONFIG — Variables d'environnement ──────
-// Ne jamais mettre les tokens en dur dans le code !
-// Définissez ces variables dans Render → Environment
-const DISCORD_TOKEN       = process.env.DISCORD_TOKEN;
-const GUILD_ID            = process.env.GUILD_ID;
-const ORDERS_CATEGORY_ID  = process.env.ORDERS_CATEGORY_ID;
+const DISCORD_TOKEN        = process.env.DISCORD_TOKEN;
+const GUILD_ID             = process.env.GUILD_ID;
+const ORDERS_CATEGORY_ID   = process.env.ORDERS_CATEGORY_ID;
 const CONTACTS_CATEGORY_ID = process.env.CONTACTS_CATEGORY_ID;
-const SUPABASE_URL        = process.env.SUPABASE_URL;
-const SUPABASE_KEY        = process.env.SUPABASE_KEY;
+const SUPABASE_URL         = process.env.SUPABASE_URL;
+const SUPABASE_KEY         = process.env.SUPABASE_KEY;
 
-// Vérification au démarrage
 const REQUIRED_ENV = ['DISCORD_TOKEN','GUILD_ID','ORDERS_CATEGORY_ID','CONTACTS_CATEGORY_ID','SUPABASE_URL','SUPABASE_KEY'];
 for (const key of REQUIRED_ENV) {
   if (!process.env[key]) {
@@ -48,8 +89,8 @@ const STATUS_LABELS = {
 // ── BOT READY ──────────────────────────────
 client.once('ready', () => {
   console.log(`✅ Bot connecté : ${client.user.tag}`);
-  // Polling toutes les 10 secondes
   setInterval(checkNotifications, 10000);
+  startKeepAlive(); // Lancer le keep-alive une fois le bot prêt
 });
 
 // ── POLL : vérifier nouvelles notifs ──────────────────
@@ -67,7 +108,6 @@ async function checkNotifications() {
       if (notif.type === 'order' && notif.order_id) {
         await handleNewOrder(notif);
       } else if (notif.type === 'contact' && notif.contact_id) {
-        // Si le contact a déjà un channel Discord → c'est un message de suivi du client
         const { data: contact } = await supabase.from('contacts').select('*').eq('id', notif.contact_id).single();
         if (contact?.discord_channel_id) {
           await handleClientReply(contact);
@@ -75,7 +115,6 @@ async function checkNotifications() {
           await handleNewContact(notif);
         }
       }
-      // Marquer comme traité
       await supabase.from('discord_notifications').update({ processed: true }).eq('id', notif.id);
     }
   } catch (err) {
@@ -92,23 +131,19 @@ async function handleNewOrder(notif) {
   const guild = client.guilds.cache.get(GUILD_ID);
   if (!guild) return console.error('Guild introuvable.');
 
-  // Compter les commandes existantes pour le numéro
   const { count } = await supabase.from('orders').select('*', { count: 'exact', head: true }).not('discord_channel_id', 'is', null);
   const channelNum = String((count || 0) + 1).padStart(2, '0');
   const channelName = `commande${channelNum}`;
 
-  // Créer le channel dans la catégorie Commandes
   const channel = await guild.channels.create({
     name: channelName,
-    type: 0, // GUILD_TEXT
+    type: 0,
     parent: ORDERS_CATEGORY_ID,
     topic: `Commande #${order.id} — ${order.client_username} — ${order.plan}`,
   });
 
-  // Enregistrer l'ID du channel dans la BDD
   await supabase.from('orders').update({ discord_channel_id: channel.id }).eq('id', order.id);
 
-  // Embed de récapitulatif
   const embed = new EmbedBuilder()
     .setColor(0x1a3dbf)
     .setTitle(`📦 Nouvelle commande #${order.id}`)
@@ -190,7 +225,6 @@ async function handleNewContact(notif) {
 
 // ── MESSAGE DE SUIVI DU CLIENT ──────────────
 async function handleClientReply(contact) {
-  // Récupérer le dernier message 'in' non encore relayé
   const { data: msgs } = await supabase
     .from('discord_messages')
     .select('*')
@@ -222,7 +256,6 @@ async function handleClientReply(contact) {
   console.log(`📨 Message client relayé dans #${channel.name}`);
 }
 
-
 // ── COMMANDES DISCORD ──────────────────────
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
@@ -240,7 +273,6 @@ client.on('messageCreate', async (message) => {
 
     if (!order) return;
 
-    // Changements de statut
     const statusCommands = {
       '^^en_cours':     'en_cours',
       '^^preparation':  'preparation',
@@ -264,13 +296,11 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // ^^contact <message> — envoyer un message visible sur le site
     if (content.startsWith('^^contact ')) {
       const msg = content.slice('^^contact '.length).trim();
       if (!msg) return message.reply('❌ Syntaxe : `^^contact <votre message>`');
 
       await supabase.from('orders').update({ ml_message: msg }).eq('id', order.id);
-      // Enregistrer dans discord_messages
       await supabase.from('discord_messages').insert({
         order_id: order.id,
         direction: 'out',
@@ -300,12 +330,10 @@ client.on('messageCreate', async (message) => {
 
     if (!contact) return;
 
-    // ^^answer <message>
     if (content.startsWith('^^answer ')) {
       const reply = content.slice('^^answer '.length).trim();
       if (!reply) return message.reply('❌ Syntaxe : `^^answer <votre réponse>`');
 
-      // Enregistrer la réponse en BDD
       await supabase.from('discord_messages').insert({
         contact_id: contact.id,
         direction: 'out',
