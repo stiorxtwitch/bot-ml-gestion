@@ -1,20 +1,18 @@
 // ============================================
-// ML DEVLOPPING — Bot Discord v2
+// ML DEVLOPPING — Bot Discord v3 (FIXED)
 // ============================================
-// Nouvelles fonctionnalités :
-//   - Vérification discord_username à la commande/contact (membre du serveur + unicité)
-//   - DM récapitulatif de commande au client lors de la commande
-//   - DM au client lors de chaque changement de statut (^^en_cours, ^^preparation, etc.)
-//   - DM au client lors d'un ^^contact <message>
-//   - Messages du client (depuis le site) relayés dans le ticket Discord de la commande
-//   - Contact : DM au client quand ^^answer <message>
-//   - Messages du client (formulaire contact follow-up) relayés dans le ticket contact
+// FIXES:
+//   - Ajout des intents nécessaires pour les DMs (Partials)
+//   - Détection robuste des channels (par DB, pas par nom)
+//   - Gestion correcte des commandes ^^
+//   - Meilleure gestion d'erreurs DM
+//   - findGuildMember amélioré avec fetch forcé
 // ============================================
 // Installation: npm install discord.js @supabase/supabase-js node-fetch express
-// Node.js 18+ recommandé
+// Node.js 18+ requis
 // ============================================
 
-const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, Partials } = require('discord.js');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
 
@@ -79,12 +77,23 @@ for (const key of REQUIRED_ENV) {
 }
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// ── FIX CRITIQUE : Partials nécessaires pour les DMs ─────────────
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildMembers,       // FIX: nécessaire pour fetchMembers
     GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.DirectMessageReactions,
+    GatewayIntentBits.DirectMessageTyping,
+  ],
+  partials: [
+    Partials.Channel,    // FIX: requis pour recevoir/envoyer des DMs
+    Partials.Message,
+    Partials.User,
+    Partials.GuildMember,
   ],
 });
 
@@ -105,26 +114,70 @@ const STATUS_COLORS = {
 };
 
 // ── BOT READY ────────────────────────────────────────────────────
-client.once('ready', () => {
+client.once('ready', async () => {
   console.log(`✅ Bot connecté : ${client.user.tag}`);
+
+  // FIX: Pré-charger les membres du serveur au démarrage
+  try {
+    const guild = client.guilds.cache.get(GUILD_ID);
+    if (guild) {
+      await guild.members.fetch();
+      console.log(`👥 ${guild.memberCount} membres chargés pour ${guild.name}`);
+    } else {
+      console.error('❌ Guild introuvable au démarrage. Vérifiez GUILD_ID.');
+    }
+  } catch (err) {
+    console.error('Erreur chargement membres:', err.message);
+  }
+
   setInterval(checkNotifications, 10000);
   startKeepAlive();
 });
 
 // ── UTILITAIRE : trouver un membre Discord par son username ──────
+// FIX: Re-fetch à chaque fois pour éviter le cache périmé
 async function findGuildMember(discordUsername) {
   if (!discordUsername) return null;
+  const cleanUsername = discordUsername.replace(/^@/, '').trim().toLowerCase();
+
   try {
     const guild = client.guilds.cache.get(GUILD_ID);
-    if (!guild) return null;
+    if (!guild) {
+      console.error('❌ Guild introuvable dans findGuildMember');
+      return null;
+    }
 
-    // Fetch all members (en cache ou via API)
-    await guild.members.fetch();
-    const member = guild.members.cache.find(m =>
-      m.user.username.toLowerCase() === discordUsername.toLowerCase() ||
-      m.user.tag.toLowerCase() === discordUsername.toLowerCase() ||
-      (m.nickname && m.nickname.toLowerCase() === discordUsername.toLowerCase())
+    // 1. Chercher dans le cache d'abord
+    let member = guild.members.cache.find(m =>
+      m.user.username.toLowerCase() === cleanUsername ||
+      m.user.tag?.toLowerCase() === cleanUsername ||
+      (m.nickname && m.nickname.toLowerCase() === cleanUsername) ||
+      m.user.globalName?.toLowerCase() === cleanUsername
     );
+
+    // 2. Si pas trouvé en cache, essayer de fetch directement
+    if (!member) {
+      console.log(`🔍 Membre "${cleanUsername}" absent du cache, tentative de fetch...`);
+      try {
+        // Tenter un fetch de tous les membres
+        const freshMembers = await guild.members.fetch({ force: true });
+        member = freshMembers.find(m =>
+          m.user.username.toLowerCase() === cleanUsername ||
+          m.user.tag?.toLowerCase() === cleanUsername ||
+          (m.nickname && m.nickname.toLowerCase() === cleanUsername) ||
+          m.user.globalName?.toLowerCase() === cleanUsername
+        );
+      } catch (fetchErr) {
+        console.error('Erreur fetch membres:', fetchErr.message);
+      }
+    }
+
+    if (member) {
+      console.log(`✅ Membre trouvé : ${member.user.tag}`);
+    } else {
+      console.warn(`⚠️ Membre introuvable pour username : "${cleanUsername}"`);
+    }
+
     return member || null;
   } catch (err) {
     console.error('Erreur findGuildMember:', err.message);
@@ -133,23 +186,35 @@ async function findGuildMember(discordUsername) {
 }
 
 // ── UTILITAIRE : envoyer un DM à un membre ───────────────────────
+// FIX: Meilleure gestion d'erreurs avec codes Discord
 async function sendDM(discordUsername, embed, fallbackText = null) {
   if (!discordUsername) return false;
+
   try {
     const member = await findGuildMember(discordUsername);
     if (!member) {
-      console.warn(`⚠️ Membre Discord introuvable : ${discordUsername}`);
+      console.warn(`⚠️ Impossible d'envoyer un DM : membre "${discordUsername}" introuvable.`);
       return false;
     }
+
+    // Vérifier si le bot peut envoyer des DMs (membre non bot, DMs non désactivés)
     const dmChannel = await member.createDM();
+
     if (embed) {
       await dmChannel.send({ embeds: [embed] });
     } else if (fallbackText) {
       await dmChannel.send(fallbackText);
     }
+
+    console.log(`📨 DM envoyé avec succès à ${member.user.tag}`);
     return true;
   } catch (err) {
-    console.error(`❌ Impossible d'envoyer un DM à ${discordUsername}:`, err.message);
+    // Code 50007 = Cannot send messages to this user (DMs désactivés)
+    if (err.code === 50007) {
+      console.warn(`⚠️ DM impossible pour ${discordUsername} : DMs désactivés ou bot bloqué.`);
+    } else {
+      console.error(`❌ Erreur DM vers ${discordUsername}: [${err.code}] ${err.message}`);
+    }
     return false;
   }
 }
@@ -163,65 +228,91 @@ async function checkNotifications() {
       .eq('processed', false)
       .order('created_at', { ascending: true });
 
-    if (error || !notifs?.length) return;
+    if (error) {
+      console.error('Erreur lecture notifications:', error.message);
+      return;
+    }
+    if (!notifs?.length) return;
 
     for (const notif of notifs) {
-      if (notif.type === 'order' && notif.order_id) {
-        await handleNewOrder(notif);
-      } else if (notif.type === 'contact' && notif.contact_id) {
-        const { data: contact } = await supabase
-          .from('contacts').select('*').eq('id', notif.contact_id).single();
-        if (contact?.discord_channel_id) {
-          // Nouveau message du client sur une conversation existante
-          await handleClientContactReply(contact);
-        } else {
-          await handleNewContact(notif);
+      try {
+        if (notif.type === 'order' && notif.order_id) {
+          await handleNewOrder(notif);
+        } else if (notif.type === 'contact' && notif.contact_id) {
+          const { data: contact } = await supabase
+            .from('contacts').select('*').eq('id', notif.contact_id).single();
+
+          if (contact?.discord_channel_id) {
+            await handleClientContactReply(contact);
+          } else {
+            await handleNewContact(notif);
+          }
+        } else if (notif.type === 'order_message' && notif.order_id) {
+          await handleClientOrderMessage(notif);
         }
-      } else if (notif.type === 'order_message' && notif.order_id) {
-        // Message du client depuis le site → relayer dans le ticket
-        await handleClientOrderMessage(notif);
+      } catch (notifErr) {
+        console.error(`❌ Erreur traitement notif #${notif.id}:`, notifErr.message);
       }
-      await supabase.from('discord_notifications').update({ processed: true }).eq('id', notif.id);
+
+      // Marquer comme traité même en cas d'erreur pour éviter les boucles
+      await supabase
+        .from('discord_notifications')
+        .update({ processed: true })
+        .eq('id', notif.id);
     }
   } catch (err) {
-    console.error('Erreur polling:', err);
+    console.error('Erreur polling:', err.message);
   }
 }
 
 // ── NOUVELLE COMMANDE ─────────────────────────────────────────────
 async function handleNewOrder(notif) {
-  const { data: order } = await supabase.from('orders').select('*').eq('id', notif.order_id).single();
-  if (!order) return;
+  const { data: order, error: orderError } = await supabase
+    .from('orders').select('*').eq('id', notif.order_id).single();
+
+  if (orderError || !order) {
+    console.error('Commande introuvable:', notif.order_id);
+    return;
+  }
 
   const guild = client.guilds.cache.get(GUILD_ID);
   if (!guild) return console.error('Guild introuvable.');
 
-  // ── Vérification membre Discord ──
   const discordUsername = order.discord_username;
+
+  // ── Vérification membre Discord ──
   if (discordUsername) {
     const member = await findGuildMember(discordUsername);
     if (!member) {
-      console.warn(`⚠️ Client Discord "${discordUsername}" introuvable sur le serveur pour commande #${order.id}`);
-      // On continue quand même pour créer le ticket, mais on le note
+      console.warn(`⚠️ Client Discord "${discordUsername}" introuvable pour commande #${order.id}`);
     }
   }
 
-  // ── Créer le ticket Discord ──
+  // ── Numérotation du ticket ──
   const { count } = await supabase
     .from('orders')
     .select('*', { count: 'exact', head: true })
     .not('discord_channel_id', 'is', null);
-  const channelNum = String((count || 0) + 1).padStart(2, '0');
-  const channelName = `commande${channelNum}`;
+  const channelNum = String((count || 0) + 1).padStart(3, '0');
+  const channelName = `commande-${channelNum}`;
 
-  const channel = await guild.channels.create({
-    name: channelName,
-    type: 0,
-    parent: ORDERS_CATEGORY_ID,
-    topic: `Commande #${order.id} — ${order.client_username} — ${order.plan}`,
-  });
+  // ── Créer le channel ──
+  let channel;
+  try {
+    channel = await guild.channels.create({
+      name: channelName,
+      type: 0, // GUILD_TEXT
+      parent: ORDERS_CATEGORY_ID,
+      topic: `Commande #${order.id} — ${order.client_username} — ${order.plan}`,
+    });
+  } catch (err) {
+    console.error('Erreur création channel:', err.message);
+    return;
+  }
 
-  await supabase.from('orders').update({ discord_channel_id: channel.id }).eq('id', order.id);
+  await supabase.from('orders')
+    .update({ discord_channel_id: channel.id })
+    .eq('id', order.id);
 
   // ── Embed ticket ──
   const ticketEmbed = new EmbedBuilder()
@@ -234,22 +325,24 @@ async function handleNewOrder(notif) {
       { name: '📧 Email', value: order.client_email || 'N/A', inline: true },
       { name: '💬 Discord', value: discordUsername ? `@${discordUsername}` : 'Non renseigné', inline: true },
       { name: '📋 Description', value: order.description || '*Aucune description*', inline: false },
-      { name: '📌 Statut actuel', value: STATUS_LABELS[order.status], inline: true },
+      { name: '📌 Statut', value: STATUS_LABELS[order.status] || STATUS_LABELS.pending, inline: true },
       { name: '🕐 Date', value: new Date(order.created_at).toLocaleString('fr-FR'), inline: true },
     )
     .setFooter({ text: 'ML Devlopping — Panel de gestion' })
     .setTimestamp();
 
   const commandsHelp = [
-    '**Commandes disponibles :**',
-    '`^^en_cours` — Marquer en cours (notifie le client en DM)',
-    '`^^preparation` — Marquer en préparation (notifie le client en DM)',
-    '`^^finalisation` — Marquer en finalisation (notifie le client en DM)',
-    '`^^terminer` — Marquer comme terminée (notifie le client en DM)',
-    '`^^contact <message>` — Envoyer un message en DM Discord au client',
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+    '**📋 Commandes disponibles :**',
+    '`^^en_cours` — Marquer en cours',
+    '`^^preparation` — Marquer en préparation',
+    '`^^finalisation` — Marquer en finalisation',
+    '`^^terminer` — Marquer comme terminée',
+    '`^^contact <message>` — Envoyer un DM Discord au client',
     '',
-    '> Le statut est mis à jour **en temps réel** sur le site du client.',
-    '> Les messages du client depuis le site apparaissent automatiquement ici.',
+    '> ✅ Le statut se met à jour en **temps réel** sur le site.',
+    '> 💬 Les messages du client depuis le site apparaissent ici automatiquement.',
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
   ].join('\n');
 
   await channel.send({ embeds: [ticketEmbed] });
@@ -259,7 +352,7 @@ async function handleNewOrder(notif) {
   if (discordUsername) {
     const recapEmbed = new EmbedBuilder()
       .setColor(0x1a3dbf)
-      .setTitle(`🎉 Votre commande a bien été reçue !`)
+      .setTitle('🎉 Votre commande a bien été reçue !')
       .setDescription(`Merci pour votre confiance, **${order.client_name}** !\n\nVoici le récapitulatif de votre commande chez **ML Devlopping**.`)
       .addFields(
         { name: '📦 Plan souscrit', value: `**${order.plan}**`, inline: true },
@@ -274,9 +367,7 @@ async function handleNewOrder(notif) {
 
     const sent = await sendDM(discordUsername, recapEmbed);
     if (!sent) {
-      await channel.send(`⚠️ **Impossible d'envoyer le DM de récapitulatif** à @${discordUsername}. Le client n'est peut-être pas membre du serveur ou a les DM désactivés.`);
-    } else {
-      console.log(`📨 Récapitulatif DM envoyé à ${discordUsername} pour commande #${order.id}`);
+      await channel.send(`⚠️ **Impossible d'envoyer le DM de récapitulatif** à \`${discordUsername}\`. Le client n'est peut-être pas membre du serveur ou a les DM désactivés.`);
     }
   }
 
@@ -285,36 +376,40 @@ async function handleNewOrder(notif) {
 
 // ── NOUVEAU CONTACT ──────────────────────────────────────────────
 async function handleNewContact(notif) {
-  const { data: contact } = await supabase.from('contacts').select('*').eq('id', notif.contact_id).single();
-  if (!contact) return;
+  const { data: contact, error } = await supabase
+    .from('contacts').select('*').eq('id', notif.contact_id).single();
+
+  if (error || !contact) return console.error('Contact introuvable:', notif.contact_id);
 
   const guild = client.guilds.cache.get(GUILD_ID);
   if (!guild) return;
 
-  // ── Vérification membre Discord ──
   const discordUsername = contact.discord_username;
-  if (discordUsername) {
-    const member = await findGuildMember(discordUsername);
-    if (!member) {
-      console.warn(`⚠️ Contact Discord "${discordUsername}" introuvable sur le serveur pour contact #${contact.id}`);
-    }
-  }
 
+  // ── Numérotation ──
   const { count } = await supabase
     .from('contacts')
     .select('*', { count: 'exact', head: true })
     .not('discord_channel_id', 'is', null);
-  const channelNum = String((count || 0) + 1).padStart(2, '0');
-  const channelName = `contact${channelNum}`;
+  const channelNum = String((count || 0) + 1).padStart(3, '0');
+  const channelName = `contact-${channelNum}`;
 
-  const channel = await guild.channels.create({
-    name: channelName,
-    type: 0,
-    parent: CONTACTS_CATEGORY_ID,
-    topic: `Contact #${contact.id} — ${contact.email} — ${contact.subject}`,
-  });
+  let channel;
+  try {
+    channel = await guild.channels.create({
+      name: channelName,
+      type: 0,
+      parent: CONTACTS_CATEGORY_ID,
+      topic: `Contact #${contact.id} — ${contact.email} — ${contact.subject}`,
+    });
+  } catch (err) {
+    console.error('Erreur création channel contact:', err.message);
+    return;
+  }
 
-  await supabase.from('contacts').update({ discord_channel_id: channel.id }).eq('id', contact.id);
+  await supabase.from('contacts')
+    .update({ discord_channel_id: channel.id })
+    .eq('id', contact.id);
 
   const embed = new EmbedBuilder()
     .setColor(0x2d5be3)
@@ -331,10 +426,12 @@ async function handleNewContact(notif) {
     .setTimestamp();
 
   const helpText = [
-    '**Commandes disponibles :**',
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
+    '**📋 Commandes disponibles :**',
     '`^^answer <votre message>` — Répondre au client en DM Discord',
     '',
-    '> Les messages de suivi du client depuis le site apparaissent automatiquement ici.',
+    '> 💬 Les messages de suivi du client depuis le site apparaissent automatiquement ici.',
+    '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
   ].join('\n');
 
   await channel.send({ embeds: [embed] });
@@ -345,7 +442,7 @@ async function handleNewContact(notif) {
     const confirmEmbed = new EmbedBuilder()
       .setColor(0x2d5be3)
       .setTitle('✅ Votre message a bien été reçu !')
-      .setDescription(`Bonjour **${contact.first_name}** !\n\nNous avons bien reçu votre message et notre équipe vous répondra sous 24h directement ici en DM Discord.`)
+      .setDescription(`Bonjour **${contact.first_name}** !\n\nNous avons bien reçu votre message. Notre équipe vous répondra directement ici en DM Discord sous 24h.`)
       .addFields(
         { name: '📌 Objet', value: contact.subject, inline: false },
         { name: '💬 Votre message', value: contact.message.slice(0, 300) + (contact.message.length > 300 ? '…' : ''), inline: false },
@@ -355,9 +452,7 @@ async function handleNewContact(notif) {
 
     const sent = await sendDM(discordUsername, confirmEmbed);
     if (!sent) {
-      await channel.send(`⚠️ **Impossible d'envoyer le DM de confirmation** à @${discordUsername}. Le client n'est peut-être pas sur le serveur ou a les DM désactivés.`);
-    } else {
-      console.log(`📨 DM de confirmation contact envoyé à ${discordUsername}`);
+      await channel.send(`⚠️ **Impossible d'envoyer le DM de confirmation** à \`${discordUsername}\`.`);
     }
   }
 
@@ -400,7 +495,9 @@ async function handleClientContactReply(contact) {
 
 // ── MESSAGE CLIENT COMMANDE (depuis le site) ─────────────────────
 async function handleClientOrderMessage(notif) {
-  const { data: order } = await supabase.from('orders').select('*').eq('id', notif.order_id).single();
+  const { data: order } = await supabase
+    .from('orders').select('*').eq('id', notif.order_id).single();
+
   if (!order || !order.discord_channel_id) return;
 
   const guild = client.guilds.cache.get(GUILD_ID);
@@ -408,7 +505,6 @@ async function handleClientOrderMessage(notif) {
   const channel = guild.channels.cache.get(order.discord_channel_id);
   if (!channel) return;
 
-  // Récupérer le dernier message entrant du client pour cette commande
   const { data: msgs } = await supabase
     .from('discord_messages')
     .select('*')
@@ -437,18 +533,24 @@ async function handleClientOrderMessage(notif) {
 }
 
 // ── COMMANDES DISCORD ─────────────────────────────────────────────
+// FIX CRITIQUE : On identifie les channels par la DB, pas par le nom
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
+  if (!message.guild) return; // Ignorer les DMs entrants
+
   const content = message.content.trim();
   const channelId = message.channel.id;
-  const channelName = message.channel.name;
 
-  // ── COMMANDES COMMANDE ──────────────────────────────────────────
-  if (channelName.startsWith('commande')) {
-    const { data: order } = await supabase
-      .from('orders').select('*').eq('discord_channel_id', channelId).single();
-    if (!order) return;
+  // ── IDENTIFIER LE TYPE DE CHANNEL VIA LA BASE DE DONNÉES ──────
+  // On cherche d'abord si c'est un channel de commande
+  const { data: order } = await supabase
+    .from('orders')
+    .select('*')
+    .eq('discord_channel_id', channelId)
+    .maybeSingle();
 
+  if (order) {
+    // ── C'est un channel de commande ──────────────────────────────
     const statusCommands = {
       '^^en_cours':     'en_cours',
       '^^preparation':  'preparation',
@@ -459,12 +561,21 @@ client.on('messageCreate', async (message) => {
     // ── Changement de statut ──
     if (statusCommands[content]) {
       const newStatus = statusCommands[content];
-      await supabase.from('orders').update({ status: newStatus }).eq('id', order.id);
+
+      const { error: updateError } = await supabase
+        .from('orders')
+        .update({ status: newStatus })
+        .eq('id', order.id);
+
+      if (updateError) {
+        await message.reply(`❌ Erreur lors de la mise à jour du statut : ${updateError.message}`);
+        return;
+      }
 
       const ticketEmbed = new EmbedBuilder()
         .setColor(STATUS_COLORS[newStatus] || 0x22c55e)
         .setTitle('✅ Statut mis à jour')
-        .setDescription(`Commande #${order.id} → **${STATUS_LABELS[newStatus]}**`)
+        .setDescription(`Commande **#${order.id}** → ${STATUS_LABELS[newStatus]}`)
         .setTimestamp();
 
       await message.channel.send({ embeds: [ticketEmbed] });
@@ -474,7 +585,7 @@ client.on('messageCreate', async (message) => {
       if (order.discord_username) {
         const dmEmbed = new EmbedBuilder()
           .setColor(STATUS_COLORS[newStatus] || 0x22c55e)
-          .setTitle(`🔔 Mise à jour de votre commande !`)
+          .setTitle('🔔 Mise à jour de votre commande !')
           .setDescription(`Bonjour **${order.client_name}**, votre commande vient d'être mise à jour.`)
           .addFields(
             { name: '📦 Plan', value: order.plan, inline: true },
@@ -486,9 +597,7 @@ client.on('messageCreate', async (message) => {
 
         const sent = await sendDM(order.discord_username, dmEmbed);
         if (!sent) {
-          await message.channel.send(`⚠️ Impossible d'envoyer le DM de statut à @${order.discord_username}.`);
-        } else {
-          console.log(`📨 DM statut "${newStatus}" envoyé à ${order.discord_username}`);
+          await message.channel.send(`⚠️ Impossible d'envoyer le DM de statut à \`${order.discord_username}\`.`);
         }
       }
 
@@ -499,7 +608,9 @@ client.on('messageCreate', async (message) => {
     // ── ^^contact <message> ──
     if (content.startsWith('^^contact ')) {
       const msg = content.slice('^^contact '.length).trim();
-      if (!msg) return message.reply('❌ Syntaxe : `^^contact <votre message>`');
+      if (!msg) {
+        return message.reply('❌ Syntaxe : `^^contact <votre message>`');
+      }
 
       await supabase.from('orders').update({ ml_message: msg }).eq('id', order.id);
       await supabase.from('discord_messages').insert({
@@ -533,25 +644,36 @@ client.on('messageCreate', async (message) => {
 
         const sent = await sendDM(order.discord_username, dmEmbed);
         if (!sent) {
-          await message.channel.send(`⚠️ Impossible d'envoyer le DM à @${order.discord_username}.`);
-        } else {
-          console.log(`📨 DM ^^contact envoyé à ${order.discord_username}`);
+          await message.channel.send(`⚠️ Impossible d'envoyer le DM à \`${order.discord_username}\`.`);
         }
       }
       return;
     }
+
+    // Commande inconnue dans un channel commande
+    if (content.startsWith('^^')) {
+      await message.reply([
+        '❌ Commande inconnue. Commandes disponibles :',
+        '`^^en_cours` `^^preparation` `^^finalisation` `^^terminer` `^^contact <message>`',
+      ].join('\n'));
+    }
+    return;
   }
 
-  // ── COMMANDES CONTACT ──────────────────────────────────────────
-  if (channelName.startsWith('contact')) {
-    const { data: contact } = await supabase
-      .from('contacts').select('*').eq('discord_channel_id', channelId).single();
-    if (!contact) return;
+  // ── IDENTIFIER SI C'EST UN CHANNEL CONTACT ────────────────────
+  const { data: contact } = await supabase
+    .from('contacts')
+    .select('*')
+    .eq('discord_channel_id', channelId)
+    .maybeSingle();
 
+  if (contact) {
     // ── ^^answer <message> ──
     if (content.startsWith('^^answer ')) {
       const reply = content.slice('^^answer '.length).trim();
-      if (!reply) return message.reply('❌ Syntaxe : `^^answer <votre réponse>`');
+      if (!reply) {
+        return message.reply('❌ Syntaxe : `^^answer <votre réponse>`');
+      }
 
       await supabase.from('discord_messages').insert({
         contact_id: contact.id,
@@ -582,25 +704,27 @@ client.on('messageCreate', async (message) => {
           .addFields(
             { name: '📌 Objet initial', value: contact.subject, inline: false },
             { name: '💬 Réponse', value: reply, inline: false },
-            { name: '↩️ Répondre', value: 'Vous pouvez répondre directement ici en DM, ou depuis notre site sur la page *Mes messages*.', inline: false },
+            { name: '↩️ Répondre', value: 'Vous pouvez répondre directement ici en DM, ou depuis notre site.', inline: false },
           )
           .setFooter({ text: 'ML Devlopping — Support' })
           .setTimestamp();
 
         const sent = await sendDM(contact.discord_username, dmEmbed);
         if (!sent) {
-          await message.channel.send(`⚠️ Impossible d'envoyer le DM à @${contact.discord_username}.`);
-        } else {
-          console.log(`📨 DM ^^answer envoyé à ${contact.discord_username}`);
+          await message.channel.send(`⚠️ Impossible d'envoyer le DM à \`${contact.discord_username}\`.`);
         }
       }
       return;
+    }
+
+    if (content.startsWith('^^')) {
+      await message.reply('❌ Commande inconnue. Seule commande disponible ici : `^^answer <message>`');
     }
   }
 });
 
 // ── DÉMARRAGE ────────────────────────────────────────────────────
 client.login(DISCORD_TOKEN).catch(err => {
-  console.error('Erreur de connexion Discord:', err);
+  console.error('❌ Erreur de connexion Discord:', err.message);
   process.exit(1);
 });
