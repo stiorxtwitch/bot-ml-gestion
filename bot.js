@@ -532,12 +532,120 @@ async function handleClientOrderMessage(notif) {
   console.log(`📨 Message client commande relayé dans #${channel.name}`);
 }
 
-// ── COMMANDES DISCORD ─────────────────────────────────────────────
-// FIX CRITIQUE : On identifie les channels par la DB, pas par le nom
+// ── DMs ENTRANTS — Réponses clients relayées dans leur ticket ────
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
-  if (!message.guild) return; // Ignorer les DMs entrants
 
+  // ── Message en DM (pas dans un serveur) ──────────────────────────
+  if (!message.guild) {
+    const content = message.content.trim();
+    if (!content) return; // Ignorer les messages vides / images seuls
+
+    const senderUsername = message.author.username.toLowerCase();
+
+    // 1. Chercher une commande active liée à ce Discord username
+    const { data: orders } = await supabase
+      .from('orders')
+      .select('*')
+      .ilike('discord_username', senderUsername)
+      .not('discord_channel_id', 'is', null)
+      .order('created_at', { ascending: false });
+
+    if (orders && orders.length > 0) {
+      // Prendre la commande la plus récente non terminée, sinon la plus récente tout court
+      const activeOrder = orders.find(o => o.status !== 'termine') || orders[0];
+
+      const guild = client.guilds.cache.get(GUILD_ID);
+      const ticketChannel = guild?.channels.cache.get(activeOrder.discord_channel_id);
+
+      if (ticketChannel) {
+        // Sauvegarder en base
+        await supabase.from('discord_messages').insert({
+          order_id: activeOrder.id,
+          direction: 'in',
+          content: content,
+        });
+
+        // Relayer dans le ticket
+        const relayEmbed = new EmbedBuilder()
+          .setColor(0xf59e0b)
+          .setTitle('💬 Réponse du client (via DM Discord)')
+          .setDescription(content)
+          .addFields(
+            { name: '👤 Client', value: activeOrder.client_name || 'N/A', inline: true },
+            { name: '🏷️ Username', value: activeOrder.client_username || 'N/A', inline: true },
+            { name: '💬 Discord', value: `@${senderUsername}`, inline: true },
+            { name: '📦 Commande', value: `${activeOrder.plan} — #${activeOrder.id}`, inline: false },
+          )
+          .setFooter({ text: `Répondez avec ^^contact <message>` })
+          .setTimestamp();
+
+        await ticketChannel.send({ embeds: [relayEmbed] });
+        console.log(`📨 DM client relayé dans #${ticketChannel.name} (commande #${activeOrder.id})`);
+
+        // Confirmer la réception au client
+        await message.react('✅');
+        await message.reply('📨 Votre message a bien été transmis à notre équipe. Nous vous répondrons dès que possible !');
+        return;
+      }
+    }
+
+    // 2. Chercher un contact actif lié à ce Discord username
+    const { data: contacts } = await supabase
+      .from('contacts')
+      .select('*')
+      .ilike('discord_username', senderUsername)
+      .not('discord_channel_id', 'is', null)
+      .order('created_at', { ascending: false });
+
+    if (contacts && contacts.length > 0) {
+      const activeContact = contacts.find(c => c.status !== 'closed') || contacts[0];
+
+      const guild = client.guilds.cache.get(GUILD_ID);
+      const ticketChannel = guild?.channels.cache.get(activeContact.discord_channel_id);
+
+      if (ticketChannel) {
+        // Sauvegarder en base
+        await supabase.from('discord_messages').insert({
+          contact_id: activeContact.id,
+          direction: 'in',
+          content: content,
+        });
+
+        // Relayer dans le ticket
+        const relayEmbed = new EmbedBuilder()
+          .setColor(0xf59e0b)
+          .setTitle('💬 Réponse du client (via DM Discord)')
+          .setDescription(content)
+          .addFields(
+            { name: '👤 Client', value: `${activeContact.first_name} ${activeContact.last_name}`, inline: true },
+            { name: '📧 Email', value: activeContact.email, inline: true },
+            { name: '💬 Discord', value: `@${senderUsername}`, inline: true },
+            { name: '📌 Objet', value: activeContact.subject, inline: false },
+          )
+          .setFooter({ text: `Répondez avec ^^answer <message>` })
+          .setTimestamp();
+
+        await ticketChannel.send({ embeds: [relayEmbed] });
+        console.log(`📨 DM client relayé dans #${ticketChannel.name} (contact #${activeContact.id})`);
+
+        await message.react('✅');
+        await message.reply('📨 Votre message a bien été transmis à notre équipe. Nous vous répondrons dès que possible !');
+        return;
+      }
+    }
+
+    // 3. Aucun ticket trouvé → message générique
+    await message.reply([
+      '👋 Bonjour ! Je suis le bot de **ML Devlopping**.',
+      '',
+      'Je n\'ai pas trouvé de commande ou de contact actif associé à votre compte Discord.',
+      '→ Rendez-vous sur **ml-devlopping.fr** pour passer une commande ou nous contacter.',
+    ].join('\n'));
+    return;
+  }
+
+// ── COMMANDES DISCORD (messages dans le serveur) ──────────────────
   const content = message.content.trim();
   const channelId = message.channel.id;
 
