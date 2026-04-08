@@ -103,6 +103,7 @@ const STATUS_LABELS = {
   preparation:  '🎨 Préparation',
   finalisation: '🔍 Finalisation',
   termine:      '✅ Terminée',
+  cloturee:     '🔒 Clôturée',
 };
 
 const STATUS_COLORS = {
@@ -111,6 +112,7 @@ const STATUS_COLORS = {
   preparation:  0xa855f7,
   finalisation: 0xec4899,
   termine:      0x22c55e,
+  cloturee:     0x6b7280,
 };
 
 // ── BOT READY ────────────────────────────────────────────────────
@@ -339,9 +341,11 @@ async function handleNewOrder(notif) {
     '`^^finalisation` — Marquer en finalisation',
     '`^^terminer` — Marquer comme terminée',
     '`^^contact <message>` — Envoyer un DM Discord au client',
+    '`^^cloturée` — Clôturer et archiver la commande',
+    '`^^delete` — Supprimer définitivement la commande et ce salon',
     '',
     '> ✅ Le statut se met à jour en **temps réel** sur le site.',
-    '> 💬 Les messages du client depuis le site apparaissent ici automatiquement.',
+    '> 💬 Les messages du client (site ou DM Discord) apparaissent ici automatiquement.',
     '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
   ].join('\n');
 
@@ -758,11 +762,109 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
+    // ── ^^cloturée ──
+    if (content === '^^cloturée' || content === '^^cloturee') {
+      const CLOSED_CATEGORY_ID = '1491163945963229254';
+
+      await supabase.from('orders').update({ status: 'cloturee' }).eq('id', order.id);
+
+      const newName = `${message.channel.name}-cloturée`;
+      try {
+        await message.channel.setParent(CLOSED_CATEGORY_ID, { lockPermissions: false });
+        await message.channel.setName(newName);
+      } catch (err) {
+        console.error('Erreur déplacement channel:', err.message);
+        await message.reply(`❌ Impossible de déplacer/renommer le salon : ${err.message}`);
+        return;
+      }
+
+      const closeEmbed = new EmbedBuilder()
+        .setColor(0x6b7280)
+        .setTitle('🔒 Commande clôturée')
+        .setDescription(`La commande **#${order.id}** a été clôturée et déplacée dans les archives.`)
+        .addFields(
+          { name: '👤 Client', value: order.client_name || 'N/A', inline: true },
+          { name: '📦 Plan', value: order.plan, inline: true },
+        )
+        .setFooter({ text: 'ML Devlopping — Archives' })
+        .setTimestamp();
+
+      await message.channel.send({ embeds: [closeEmbed] });
+      await message.react('🔒');
+
+      if (order.discord_username) {
+        const dmEmbed = new EmbedBuilder()
+          .setColor(0x6b7280)
+          .setTitle('🔒 Votre commande a été clôturée')
+          .setDescription(`Bonjour **${order.client_name}**, votre commande a été clôturée par notre équipe.`)
+          .addFields(
+            { name: '📦 Plan', value: order.plan, inline: true },
+            { name: '📌 Statut', value: '🔒 Clôturée', inline: true },
+            { name: '💬 Une question ?', value: 'Contactez-nous via le formulaire sur notre site.', inline: false },
+          )
+          .setFooter({ text: `ML Devlopping — Commande #${order.id}` })
+          .setTimestamp();
+
+        const sent = await sendDM(order.discord_username, dmEmbed);
+        if (!sent) {
+          await message.channel.send(`⚠️ Impossible d'envoyer le DM de clôture à \`${order.discord_username}\`.`);
+        }
+      }
+
+      console.log(`🔒 Commande #${order.id} clôturée → déplacée dans archives`);
+      return;
+    }
+
+    // ── ^^delete ──
+    if (content === '^^delete') {
+      const confirmEmbed = new EmbedBuilder()
+        .setColor(0xef4444)
+        .setTitle('⚠️ Suppression en cours...')
+        .setDescription(`Suppression de la commande **#${order.id}** et de ce salon dans **5 secondes**.\n\nCette action est **irréversible**.`)
+        .setTimestamp();
+
+      await message.channel.send({ embeds: [confirmEmbed] });
+      await message.react('🗑️');
+
+      // DM au client avant suppression
+      if (order.discord_username) {
+        const dmEmbed = new EmbedBuilder()
+          .setColor(0xef4444)
+          .setTitle('🗑️ Votre commande a été supprimée')
+          .setDescription(`Bonjour **${order.client_name}**, votre commande a été supprimée de notre système par notre équipe.`)
+          .addFields(
+            { name: '📦 Plan', value: order.plan, inline: true },
+            { name: '🔢 Référence', value: `#${order.id}`, inline: true },
+            { name: '💬 Une question ?', value: 'Contactez-nous via le formulaire sur notre site.', inline: false },
+          )
+          .setFooter({ text: 'ML Devlopping — Support' })
+          .setTimestamp();
+
+        await sendDM(order.discord_username, dmEmbed);
+      }
+
+      // Attendre 5 secondes puis tout supprimer
+      setTimeout(async () => {
+        try {
+          await supabase.from('discord_messages').delete().eq('order_id', order.id);
+          await supabase.from('discord_notifications').delete().eq('order_id', order.id);
+          await supabase.from('orders').delete().eq('id', order.id);
+          await message.channel.delete('Commande supprimée via ^^delete');
+          console.log(`🗑️ Commande #${order.id} supprimée (BDD + Discord)`);
+        } catch (err) {
+          console.error('Erreur suppression commande:', err.message);
+        }
+      }, 5000);
+
+      return;
+    }
+
     // Commande inconnue dans un channel commande
     if (content.startsWith('^^')) {
       await message.reply([
         '❌ Commande inconnue. Commandes disponibles :',
-        '`^^en_cours` `^^preparation` `^^finalisation` `^^terminer` `^^contact <message>`',
+        '`^^en_cours` `^^preparation` `^^finalisation` `^^terminer`',
+        '`^^contact <message>` `^^cloturée` `^^delete`',
       ].join('\n'));
     }
     return;
