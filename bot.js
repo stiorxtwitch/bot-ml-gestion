@@ -644,7 +644,7 @@ client.on('messageCreate', async (message) => {
       '👋 Bonjour ! Je suis le bot de **ML Devlopping**.',
       '',
       'Je n\'ai pas trouvé de commande ou de contact actif associé à votre compte Discord.',
-      '→ Rendez-vous sur **https://stiorxtwitch.github.io/ml-devlopping/** pour passer une commande ou nous contacter.',
+      '→ Rendez-vous sur **notre site** pour passer une commande ou nous contacter.',
     ].join('\n'));
     return;
   }
