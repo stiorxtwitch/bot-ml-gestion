@@ -1,12 +1,13 @@
 // ============================================
-// ML DEVLOPPING — Bot Discord v3 (FIXED)
+// ML DEVLOPPING — Bot Discord v3.1 (STABLE)
 // ============================================
-// FIXES:
-//   - Ajout des intents nécessaires pour les DMs (Partials)
-//   - Détection robuste des channels (par DB, pas par nom)
-//   - Gestion correcte des commandes ^^
-//   - Meilleure gestion d'erreurs DM
-//   - findGuildMember amélioré avec fetch forcé
+// FIXES v3.1:
+//   - Gestion globale des erreurs non-capturées (crash évité)
+//   - guild.members.fetch() limité pour éviter le timeout au démarrage
+//   - checkNotifications avec guard anti-overlap
+//   - findGuildMember : re-fetch global remplacé par fetch ciblé par username
+//   - Reconnexion automatique sur disconnect/error
+//   - Keep-alive renforcé
 // ============================================
 // Installation: npm install discord.js @supabase/supabase-js node-fetch express
 // Node.js 18+ requis
@@ -15,6 +16,16 @@
 const { Client, GatewayIntentBits, EmbedBuilder, Partials } = require('discord.js');
 const { createClient } = require('@supabase/supabase-js');
 const express = require('express');
+
+// ── GESTION GLOBALE DES ERREURS (évite les crashs silencieux) ────
+// FIX CRITIQUE : Sans ça, une seule promesse rejetée peut tuer le process
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('❌ [unhandledRejection]', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('❌ [uncaughtException]', err.message, err.stack);
+  // On NE quitte PAS le process — on laisse tourner
+});
 
 // ── EXPRESS SERVER (Keep-Alive pour Render) ──────────────────────
 const app = express();
@@ -37,7 +48,7 @@ app.listen(PORT, () => {
   console.log(`🌐 Serveur Express actif sur le port ${PORT}`);
 });
 
-// ── AUTO PING (toutes les 5 minutes) ─────────────────────────────
+// ── AUTO PING (toutes les 4 minutes — Render free tier timeout = 15min) ─
 const RENDER_URL = process.env.RENDER_URL;
 
 function startKeepAlive() {
@@ -45,6 +56,7 @@ function startKeepAlive() {
     console.warn('⚠️  RENDER_URL non défini — keep-alive désactivé');
     return;
   }
+  // FIX : 4 minutes au lieu de 5 pour rester bien en dessous du timeout Render
   setInterval(async () => {
     try {
       const res = await fetch(`${RENDER_URL}/ping`);
@@ -53,8 +65,8 @@ function startKeepAlive() {
     } catch (err) {
       console.error('❌ Keep-alive ping échoué:', err.message);
     }
-  }, 5 * 60 * 1000);
-  console.log(`🔁 Keep-alive démarré → ${RENDER_URL}/ping`);
+  }, 4 * 60 * 1000);
+  console.log(`🔁 Keep-alive démarré → ${RENDER_URL}/ping (toutes les 4 min)`);
 }
 
 // ── CONFIG — Variables d'environnement ──────────────────────────
@@ -78,23 +90,41 @@ for (const key of REQUIRED_ENV) {
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
-// ── FIX CRITIQUE : Partials nécessaires pour les DMs ─────────────
+// ── CLIENT DISCORD ────────────────────────────────────────────────
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers,       // FIX: nécessaire pour fetchMembers
+    GatewayIntentBits.GuildMembers,
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.DirectMessageReactions,
     GatewayIntentBits.DirectMessageTyping,
   ],
   partials: [
-    Partials.Channel,    // FIX: requis pour recevoir/envoyer des DMs
+    Partials.Channel,
     Partials.Message,
     Partials.User,
     Partials.GuildMember,
   ],
+});
+
+// ── GESTION RECONNEXION DISCORD ──────────────────────────────────
+// FIX : Discord.js peut perdre la connexion sans replanter le process
+client.on('disconnect', () => {
+  console.warn('⚠️ Bot déconnecté de Discord — tentative de reconnexion...');
+});
+
+client.on('error', (err) => {
+  console.error('❌ Erreur client Discord:', err.message);
+});
+
+client.on('warn', (info) => {
+  console.warn('⚠️ Avertissement Discord:', info);
+});
+
+client.on('shardError', (err) => {
+  console.error('❌ Erreur shard WebSocket:', err.message);
 });
 
 const STATUS_LABELS = {
@@ -119,25 +149,37 @@ const STATUS_COLORS = {
 client.once('ready', async () => {
   console.log(`✅ Bot connecté : ${client.user.tag}`);
 
-  // FIX: Pré-charger les membres du serveur au démarrage
-  try {
-    const guild = client.guilds.cache.get(GUILD_ID);
-    if (guild) {
-      await guild.members.fetch();
-      console.log(`👥 ${guild.memberCount} membres chargés pour ${guild.name}`);
-    } else {
-      console.error('❌ Guild introuvable au démarrage. Vérifiez GUILD_ID.');
-    }
-  } catch (err) {
-    console.error('Erreur chargement membres:', err.message);
+  // FIX : On ne fetch PAS tous les membres au démarrage (trop lourd, peut timeout)
+  // Le cache se remplit naturellement, et findGuildMember gère le fetch ciblé
+  const guild = client.guilds.cache.get(GUILD_ID);
+  if (guild) {
+    console.log(`🏠 Guild trouvée : ${guild.name} (${guild.memberCount} membres)`);
+  } else {
+    console.error('❌ Guild introuvable au démarrage. Vérifiez GUILD_ID.');
   }
 
-  setInterval(checkNotifications, 10000);
+  // FIX : Guard pour éviter l'overlap des appels checkNotifications
+  let isChecking = false;
+  setInterval(async () => {
+    if (isChecking) {
+      console.warn('⏭️ checkNotifications ignoré (précédent encore en cours)');
+      return;
+    }
+    isChecking = true;
+    try {
+      await checkNotifications();
+    } catch (err) {
+      console.error('❌ Erreur checkNotifications:', err.message);
+    } finally {
+      isChecking = false;
+    }
+  }, 10000);
+
   startKeepAlive();
 });
 
 // ── UTILITAIRE : trouver un membre Discord par son username ──────
-// FIX: Re-fetch à chaque fois pour éviter le cache périmé
+// FIX : Fetch ciblé par username au lieu de re-fetcher TOUS les membres
 async function findGuildMember(discordUsername) {
   if (!discordUsername) return null;
   const cleanUsername = discordUsername.replace(/^@/, '').trim().toLowerCase();
@@ -149,7 +191,7 @@ async function findGuildMember(discordUsername) {
       return null;
     }
 
-    // 1. Chercher dans le cache d'abord
+    // 1. Chercher dans le cache d'abord (pas de requête réseau)
     let member = guild.members.cache.find(m =>
       m.user.username.toLowerCase() === cleanUsername ||
       m.user.tag?.toLowerCase() === cleanUsername ||
@@ -157,20 +199,20 @@ async function findGuildMember(discordUsername) {
       m.user.globalName?.toLowerCase() === cleanUsername
     );
 
-    // 2. Si pas trouvé en cache, essayer de fetch directement
+    // 2. Si pas en cache, fetch CIBLÉ par username (pas fetch() global)
     if (!member) {
-      console.log(`🔍 Membre "${cleanUsername}" absent du cache, tentative de fetch...`);
+      console.log(`🔍 "${cleanUsername}" absent du cache, fetch ciblé...`);
       try {
-        // Tenter un fetch de tous les membres
-        const freshMembers = await guild.members.fetch({ force: true });
-        member = freshMembers.find(m =>
+        // fetch() avec query fait une recherche Discord API ciblée — beaucoup moins lourd
+        const results = await guild.members.fetch({ query: cleanUsername, limit: 5 });
+        member = results.find(m =>
           m.user.username.toLowerCase() === cleanUsername ||
           m.user.tag?.toLowerCase() === cleanUsername ||
           (m.nickname && m.nickname.toLowerCase() === cleanUsername) ||
           m.user.globalName?.toLowerCase() === cleanUsername
         );
       } catch (fetchErr) {
-        console.error('Erreur fetch membres:', fetchErr.message);
+        console.error('Erreur fetch membre ciblé:', fetchErr.message);
       }
     }
 
@@ -188,7 +230,6 @@ async function findGuildMember(discordUsername) {
 }
 
 // ── UTILITAIRE : envoyer un DM à un membre ───────────────────────
-// FIX: Meilleure gestion d'erreurs avec codes Discord
 async function sendDM(discordUsername, embed, fallbackText = null) {
   if (!discordUsername) return false;
 
@@ -199,7 +240,6 @@ async function sendDM(discordUsername, embed, fallbackText = null) {
       return false;
     }
 
-    // Vérifier si le bot peut envoyer des DMs (membre non bot, DMs non désactivés)
     const dmChannel = await member.createDM();
 
     if (embed) {
@@ -211,7 +251,6 @@ async function sendDM(discordUsername, embed, fallbackText = null) {
     console.log(`📨 DM envoyé avec succès à ${member.user.tag}`);
     return true;
   } catch (err) {
-    // Code 50007 = Cannot send messages to this user (DMs désactivés)
     if (err.code === 50007) {
       console.warn(`⚠️ DM impossible pour ${discordUsername} : DMs désactivés ou bot bloqué.`);
     } else {
@@ -228,7 +267,8 @@ async function checkNotifications() {
       .from('discord_notifications')
       .select('*')
       .eq('processed', false)
-      .order('created_at', { ascending: true });
+      .order('created_at', { ascending: true })
+      .limit(10); // FIX : Limite pour éviter de traiter 1000 notifs d'un coup
 
     if (error) {
       console.error('Erreur lecture notifications:', error.message);
@@ -282,7 +322,6 @@ async function handleNewOrder(notif) {
 
   const discordUsername = order.discord_username;
 
-  // ── Vérification membre Discord ──
   if (discordUsername) {
     const member = await findGuildMember(discordUsername);
     if (!member) {
@@ -290,7 +329,6 @@ async function handleNewOrder(notif) {
     }
   }
 
-  // ── Numérotation du ticket ──
   const { count } = await supabase
     .from('orders')
     .select('*', { count: 'exact', head: true })
@@ -298,12 +336,11 @@ async function handleNewOrder(notif) {
   const channelNum = String((count || 0) + 1).padStart(3, '0');
   const channelName = `commande-${channelNum}`;
 
-  // ── Créer le channel ──
   let channel;
   try {
     channel = await guild.channels.create({
       name: channelName,
-      type: 0, // GUILD_TEXT
+      type: 0,
       parent: ORDERS_CATEGORY_ID,
       topic: `Commande #${order.id} — ${order.client_username} — ${order.plan}`,
     });
@@ -316,7 +353,6 @@ async function handleNewOrder(notif) {
     .update({ discord_channel_id: channel.id })
     .eq('id', order.id);
 
-  // ── Embed ticket ──
   const ticketEmbed = new EmbedBuilder()
     .setColor(0x1a3dbf)
     .setTitle(`📦 Nouvelle commande #${order.id}`)
@@ -352,7 +388,6 @@ async function handleNewOrder(notif) {
   await channel.send({ embeds: [ticketEmbed] });
   await channel.send(commandsHelp);
 
-  // ── DM récapitulatif au client ──
   if (discordUsername) {
     const recapEmbed = new EmbedBuilder()
       .setColor(0x1a3dbf)
@@ -390,7 +425,6 @@ async function handleNewContact(notif) {
 
   const discordUsername = contact.discord_username;
 
-  // ── Numérotation ──
   const { count } = await supabase
     .from('contacts')
     .select('*', { count: 'exact', head: true })
@@ -441,7 +475,6 @@ async function handleNewContact(notif) {
   await channel.send({ embeds: [embed] });
   await channel.send(helpText);
 
-  // ── DM de confirmation au client ──
   if (discordUsername) {
     const confirmEmbed = new EmbedBuilder()
       .setColor(0x2d5be3)
@@ -463,7 +496,7 @@ async function handleNewContact(notif) {
   console.log(`✅ Channel contact créé : #${channelName}`);
 }
 
-// ── SUIVI CLIENT CONTACT (message follow-up depuis le site) ──────
+// ── SUIVI CLIENT CONTACT ─────────────────────────────────────────
 async function handleClientContactReply(contact) {
   const { data: msgs } = await supabase
     .from('discord_messages')
@@ -497,7 +530,7 @@ async function handleClientContactReply(contact) {
   console.log(`📨 Message client contact relayé dans #${channel.name}`);
 }
 
-// ── MESSAGE CLIENT COMMANDE (depuis le site) ─────────────────────
+// ── MESSAGE CLIENT COMMANDE ───────────────────────────────────────
 async function handleClientOrderMessage(notif) {
   const { data: order } = await supabase
     .from('orders').select('*').eq('id', notif.order_id).single();
@@ -536,18 +569,17 @@ async function handleClientOrderMessage(notif) {
   console.log(`📨 Message client commande relayé dans #${channel.name}`);
 }
 
-// ── DMs ENTRANTS — Réponses clients relayées dans leur ticket ────
+// ── MESSAGES (DMs entrants + commandes serveur) ───────────────────
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
-  // ── Message en DM (pas dans un serveur) ──────────────────────────
+  // ── Message en DM ────────────────────────────────────────────────
   if (!message.guild) {
     const content = message.content.trim();
-    if (!content) return; // Ignorer les messages vides / images seuls
+    if (!content) return;
 
     const senderUsername = message.author.username.toLowerCase();
 
-    // 1. Chercher une commande active liée à ce Discord username
     const { data: orders } = await supabase
       .from('orders')
       .select('*')
@@ -556,21 +588,18 @@ client.on('messageCreate', async (message) => {
       .order('created_at', { ascending: false });
 
     if (orders && orders.length > 0) {
-      // Prendre la commande la plus récente non terminée, sinon la plus récente tout court
       const activeOrder = orders.find(o => o.status !== 'termine') || orders[0];
 
       const guild = client.guilds.cache.get(GUILD_ID);
       const ticketChannel = guild?.channels.cache.get(activeOrder.discord_channel_id);
 
       if (ticketChannel) {
-        // Sauvegarder en base
         await supabase.from('discord_messages').insert({
           order_id: activeOrder.id,
           direction: 'in',
           content: content,
         });
 
-        // Relayer dans le ticket
         const relayEmbed = new EmbedBuilder()
           .setColor(0xf59e0b)
           .setTitle('💬 Réponse du client (via DM Discord)')
@@ -587,14 +616,12 @@ client.on('messageCreate', async (message) => {
         await ticketChannel.send({ embeds: [relayEmbed] });
         console.log(`📨 DM client relayé dans #${ticketChannel.name} (commande #${activeOrder.id})`);
 
-        // Confirmer la réception au client
         await message.react('✅');
         await message.reply('📨 Votre message a bien été transmis à notre équipe. Nous vous répondrons dès que possible !');
         return;
       }
     }
 
-    // 2. Chercher un contact actif lié à ce Discord username
     const { data: contacts } = await supabase
       .from('contacts')
       .select('*')
@@ -609,14 +636,12 @@ client.on('messageCreate', async (message) => {
       const ticketChannel = guild?.channels.cache.get(activeContact.discord_channel_id);
 
       if (ticketChannel) {
-        // Sauvegarder en base
         await supabase.from('discord_messages').insert({
           contact_id: activeContact.id,
           direction: 'in',
           content: content,
         });
 
-        // Relayer dans le ticket
         const relayEmbed = new EmbedBuilder()
           .setColor(0xf59e0b)
           .setTitle('💬 Réponse du client (via DM Discord)')
@@ -639,7 +664,6 @@ client.on('messageCreate', async (message) => {
       }
     }
 
-    // 3. Aucun ticket trouvé → message générique
     await message.reply([
       '👋 Bonjour ! Je suis le bot de **ML Devlopping**.',
       '',
@@ -649,12 +673,10 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-// ── COMMANDES DISCORD (messages dans le serveur) ──────────────────
+  // ── COMMANDES DISCORD (messages dans le serveur) ──────────────────
   const content = message.content.trim();
   const channelId = message.channel.id;
 
-  // ── IDENTIFIER LE TYPE DE CHANNEL VIA LA BASE DE DONNÉES ──────
-  // On cherche d'abord si c'est un channel de commande
   const { data: order } = await supabase
     .from('orders')
     .select('*')
@@ -662,7 +684,6 @@ client.on('messageCreate', async (message) => {
     .maybeSingle();
 
   if (order) {
-    // ── C'est un channel de commande ──────────────────────────────
     const statusCommands = {
       '^^en_cours':     'en_cours',
       '^^preparation':  'preparation',
@@ -670,7 +691,6 @@ client.on('messageCreate', async (message) => {
       '^^terminer':     'termine',
     };
 
-    // ── Changement de statut ──
     if (statusCommands[content]) {
       const newStatus = statusCommands[content];
 
@@ -693,7 +713,6 @@ client.on('messageCreate', async (message) => {
       await message.channel.send({ embeds: [ticketEmbed] });
       await message.react('✅');
 
-      // ── DM de notification au client ──
       if (order.discord_username) {
         const dmEmbed = new EmbedBuilder()
           .setColor(STATUS_COLORS[newStatus] || 0x22c55e)
@@ -717,7 +736,6 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // ── ^^contact <message> ──
     if (content.startsWith('^^contact ')) {
       const msg = content.slice('^^contact '.length).trim();
       if (!msg) {
@@ -741,7 +759,6 @@ client.on('messageCreate', async (message) => {
       await message.channel.send({ embeds: [ticketEmbed] });
       await message.react('📨');
 
-      // ── DM au client ──
       if (order.discord_username) {
         const dmEmbed = new EmbedBuilder()
           .setColor(0x4f7af8)
@@ -762,7 +779,6 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // ── ^^cloturée ──
     if (content === '^^cloturée' || content === '^^cloturee') {
       const CLOSED_CATEGORY_ID = '1491163945963229254';
 
@@ -815,7 +831,6 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // ── ^^delete ──
     if (content === '^^delete') {
       const confirmEmbed = new EmbedBuilder()
         .setColor(0xef4444)
@@ -826,7 +841,6 @@ client.on('messageCreate', async (message) => {
       await message.channel.send({ embeds: [confirmEmbed] });
       await message.react('🗑️');
 
-      // DM au client avant suppression
       if (order.discord_username) {
         const dmEmbed = new EmbedBuilder()
           .setColor(0xef4444)
@@ -843,7 +857,6 @@ client.on('messageCreate', async (message) => {
         await sendDM(order.discord_username, dmEmbed);
       }
 
-      // Attendre 5 secondes puis tout supprimer
       setTimeout(async () => {
         try {
           await supabase.from('discord_messages').delete().eq('order_id', order.id);
@@ -859,7 +872,6 @@ client.on('messageCreate', async (message) => {
       return;
     }
 
-    // Commande inconnue dans un channel commande
     if (content.startsWith('^^')) {
       await message.reply([
         '❌ Commande inconnue. Commandes disponibles :',
@@ -870,7 +882,7 @@ client.on('messageCreate', async (message) => {
     return;
   }
 
-  // ── IDENTIFIER SI C'EST UN CHANNEL CONTACT ────────────────────
+  // ── CHANNEL CONTACT ───────────────────────────────────────────────
   const { data: contact } = await supabase
     .from('contacts')
     .select('*')
@@ -878,7 +890,6 @@ client.on('messageCreate', async (message) => {
     .maybeSingle();
 
   if (contact) {
-    // ── ^^answer <message> ──
     if (content.startsWith('^^answer ')) {
       const reply = content.slice('^^answer '.length).trim();
       if (!reply) {
@@ -905,7 +916,6 @@ client.on('messageCreate', async (message) => {
       await message.channel.send({ embeds: [ticketEmbed] });
       await message.react('✅');
 
-      // ── DM au client ──
       if (contact.discord_username) {
         const dmEmbed = new EmbedBuilder()
           .setColor(0x22c55e)
